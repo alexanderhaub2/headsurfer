@@ -28,13 +28,28 @@ The renderer instances coins, buildings and trees, pools obstacle/power-up meshe
 
 ## Rome Rail Pursuit assets and audio
 
-The route uses **real textured GLB meshes**, not PNG/WebP billboards. Eight optimized models live in `public/assets/models/`: two buildings, two trains, three pursuing mafiosi, and an archived station canopy (currently disabled in the scene because it obstructed the view). The four existing source GLBs were optimized; the image-only pursuers and silver metro car were converted into new textured 3D models. GLTFLoader uses its bundled MeshoptDecoder. Models load asynchronously with procedural fallbacks; no camera ML is loaded for keyboard/swipe play.
+The route uses **real textured GLB meshes**, not PNG/WebP billboards. Six optimized scenery models live in `public/assets/models/`: two buildings, three pursuing mafiosi, and an archived station canopy (currently disabled in the scene because it obstructed the view). Everything on the line itself (track, trains, obstacles, coins and power-ups) comes from the authored **Rome Rail Kit** below. GLTFLoader uses its bundled MeshoptDecoder. Models load asynchronously with procedural fallbacks; no camera ML is loaded for keyboard/swipe play.
 
-The complete model pack is approximately **1.8 MB on disk**. Building models use shared instanced geometry with unused slots explicitly hidden (preventing stray buildings at the player origin). Trains are assembled from car-sized models instead of stretching one mesh over a long obstacle. Mafiosi face the same travel direction as the player and stay behind, with lightweight run bob/sway and a closer position on stumble/game-over. They are visual pursuers, not a new collision mechanic or skeletal animation system. Reduced motion suppresses their bob/sway. Original source assets remain preserved in `asset-sources/rome-rail-pursuit/`, excluded from Docker's build context.
+The scenery pack is approximately **1.3 MB on disk**. Building models use shared instanced geometry with unused slots explicitly hidden (preventing stray buildings at the player origin). Mafiosi face the same travel direction as the player and stay behind, with lightweight run bob/sway and a closer position on stumble/game-over. They are visual pursuers, not a new collision mechanic or skeletal animation system. Reduced motion suppresses their bob/sway. Original source assets (including the retired AI-generated train cars) remain preserved in `asset-sources/rome-rail-pursuit/`, excluded from Docker's build context.
 
 `scripts/optimize-models.mjs` documents the optional offline toolchain used to simplify geometry, compress it with meshopt, resize base-color maps to 1024px (512px for pursuers), and discard costly normal/ORM maps. Prebuilt runtime GLBs are committed; this tooling is **not** installed during normal development or Docker builds.
 
 The same pack provides `public/assets/audio/mediterranean-chase.mp3` plus lane-switch, jump, roll, coin, power-up, near-miss, and collision MP3 effects. BGM starts with a run, pauses with the run, and is stopped for a new run, idle state, or game-over; controller teardown disposes the sound system. The art and audio are original route assets with no external brand marks or textual signage.
+
+### Rome Rail Kit (track, trains, obstacles, pickups)
+
+`public/assets/models/kit/` holds four authored GLBs (**about 1.1 MB total**, meshopt-compressed with WebP textures) built to gameplay dimensions, so nothing is stretched to fit:
+
+| File | Contents |
+| --- | --- |
+| `rail-track.glb` | 6 m seamless track segments for all three lanes: profiled steel rails, concrete sleepers on tie plates with spring clips, a sunken ballast bed and travertine curbs. A worn variant (jointed fishplates, timber sleepers, weeds) appears on about one segment in five, and a lite LOD replaces fastening detail beyond 54 m. |
+| `trains.glb` | Modular rolling stock in five families: silver Roman **metro**, red-and-white **regional** EMU, cream-and-green **Littorina** railcar, streamlined blue **express**, and **freight** (boxcars, short boxcars, tank wagons, mixed per consist). Cab, door/window/joint bay and tail modules plus bogies are composed at runtime to any obstacle length, with baked weathering and a soft contact shadow. Oncoming trains light their headlamps and cast a headlight wash onto the sleepers ahead as a warning. |
+| `track-obstacles.glb` | Three barrier variants (roadworks barrier, travertine blocks, market crates) and three overhead gates (level-crossing boom, Roman column on plinths, scaffold bridge). |
+| `pickups.glb` | A gold **aureus** coin with laurel and SPQR relief, plus laurel-wreath multiplier, horseshoe magnet and legionary scutum shield power-ups. |
+
+`src/game/trackKit.ts` loads the kit, then composes trains and props deterministically from each obstacle id. Parked trains face the player cab-first; oncoming (`moving`) trains use the metro, regional and express families. The track is a 37-slot instanced conveyor in which each variant draws only the slots it fills. If any kit file is missing or fails to decode, the original procedural track, box trains and simple pickups remain. Collision sizes in `world.ts` are unchanged.
+
+The kit is generated offline by `node scripts/build-rome-rail-kit.mjs [track|trains|props]`, which uses the same `--no-save` toolchain as `scripts/optimize-models.mjs` (see the script header). Outputs are committed, so normal installs and Docker builds never run it. In development, `/kit-preview.html?view=lineup|fronts|side|freight|props|pickups|game` shows a showroom under game lighting, and `view=gameplay&seed=7&s=160` drives the real `GameRenderer` with a fast-forwarded, invulnerable `World`. The only lettering in the kit is the historical SPQR legend on the coin; destination boards are abstract dot-matrix patterns.
 
 ## Production with Docker
 

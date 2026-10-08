@@ -16,6 +16,32 @@
       "assets/runtime/trenchcoat-pursuer.webp",
       "assets/runtime/floral-pursuer.webp"
     ],
+    "railKit": {
+      "note": "Authored GLBs for everything on the line; supersede the retired silver/terracotta train GLBs.",
+      "track": {
+        "file": "assets/models/kit/rail-track.glb",
+        "parts": ["track:clean", "track:worn", "track:far"],
+        "segmentLength": 6
+      },
+      "trains": {
+        "file": "assets/models/kit/trains.glb",
+        "passengerFamilies": ["metro", "regional", "littorina", "express"],
+        "modules": ["cab", "bayD", "bayW", "bayJ", "tail"],
+        "freight": ["freight:boxcar", "freight:boxcarShort", "freight:tank"],
+        "running": ["bogie:passenger", "bogie:freight", "axle:freight"]
+      },
+      "obstacles": {
+        "file": "assets/models/kit/track-obstacles.glb",
+        "barriers": ["works", "travertine", "crates"],
+        "gates": ["crossing", "column", "scaffold"]
+      },
+      "pickups": {
+        "file": "assets/models/kit/pickups.glb",
+        "coin": "aureus",
+        "powers": ["multiplier (laurel wreath)", "magnet (horseshoe)", "shield (scutum)"]
+      },
+      "generator": "scripts/build-rome-rail-kit.mjs"
+    },
     "music": "assets/audio/mediterranean-chase.mp3",
     "effects": [
       "assets/audio/lane-switch.mp3",
@@ -35,6 +61,7 @@
   ],
   "integration": {
     "renderer": "src/game/renderer.ts",
+    "railKit": "src/game/trackKit.ts",
     "audio": "src/game/audio.ts",
     "controller": "src/game/controller.ts"
   }

@@ -2,6 +2,17 @@ import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { MeshoptDecoder } from "three/examples/jsm/libs/meshopt_decoder.module.js";
 import { LANE_WIDTH } from "./config";
+import {
+  BARRIER_VARIANTS,
+  GATE_VARIANTS,
+  KIT_SEGMENT_LENGTH,
+  TrackKit,
+  kitHash,
+  trainStyleFor,
+  type BarrierVariant,
+  type GateVariant,
+  type TrainStyle,
+} from "./trackKit";
 import type { Obstacle, Pickup, World } from "./world";
 import type { Outfit } from "../meta/progression";
 
@@ -9,24 +20,27 @@ const SKY = 0x8fc9d9;
 const TRACK_LENGTH = 420;
 const SLEEPER_SPACING = 2;
 const COIN_CAPACITY = 256;
-const MODEL_WIDTH = 2.08;
+// Track conveyor coverage around the player (fog is opaque from 185 m).
+const TRACK_AHEAD = 196;
+const TRACK_BEHIND = 18;
+// Beyond this distance segments switch to the lite LOD (no fastenings or weeds).
+const TRACK_DETAIL_DISTANCE = 54;
+const CORRIDOR_HALF_WIDTH = (LANE_WIDTH * 3 + 0.8) / 2;
+const kitUrl = () => `${import.meta.env.BASE_URL}assets/models/kit/`;
 // The generated canopy reads as a block on the line at gameplay distances.
 const SHOW_STATION_CANOPY: boolean = false;
 const modelUrl = (name: string) => `${import.meta.env.BASE_URL}assets/models/${name}.glb`;
 
 type FacadeKey = "palazzo" | "naples";
-type ModelKey = FacadeKey | "station" | "silverTrain" | "terracottaTrain" | "fedora" | "trenchcoat" | "floral";
+type ModelKey = FacadeKey | "station" | "fedora" | "trenchcoat" | "floral";
 const MAX_POOLED_OBSTACLES = 64;
 const MAX_POOLED_PER_OBSTACLE_VARIANT = 3;
 const MAX_POOLED_POWERS = 12;
 const MAX_POOLED_PER_POWER_KIND = 3;
-const TRAIN_MODEL_KEYS: ModelKey[] = ["silverTrain", "terracottaTrain"];
 const MODEL_FILES: Record<ModelKey, string> = {
   palazzo: "travertine-palazzo",
   naples: "naples-balcony-house",
   station: "volcanic-station-canopy",
-  silverTrain: "silver-metro-car",
-  terracottaTrain: "terracotta-commuter-car",
   fedora: "fedora-pursuer",
   trenchcoat: "trenchcoat-pursuer",
   floral: "floral-pursuer",
@@ -131,6 +145,13 @@ interface ModelBatch {
   primitive: ModelPrimitive;
 }
 
+interface TrackBatch {
+  mesh: THREE.InstancedMesh;
+  /** 0 = clean concrete segment, 1 = worn jointed segment, 2 = distant LOD. */
+  variant: number;
+  matrix: THREE.Matrix4;
+}
+
 /** Renders a World snapshot. Holds no game state of its own beyond animation. */
 export class GameRenderer {
   readonly renderer: THREE.WebGLRenderer;
@@ -149,6 +170,12 @@ export class GameRenderer {
   private readonly loadedTextures = new Set<THREE.Texture>();
   private readonly buildingBatches: Partial<Record<FacadeKey, ModelBatch[]>> = {};
   private stationBatches?: ModelBatch[];
+  /** Authored Rome Rail Kit (track, trains, obstacles, pickups); null until loaded. */
+  private kit: TrackKit | null = null;
+  private trackBatches: TrackBatch[] = [];
+  private trackSlots = 0;
+  private readonly fallbackTrack: THREE.Object3D[] = [];
+  private readonly segmentMatrix = new THREE.Matrix4();
   private player!: PlayerRig;
   private coinMesh!: THREE.InstancedMesh;
   private readonly instanceDummy = new THREE.Object3D();
@@ -205,6 +232,7 @@ export class GameRenderer {
     track.rotation.x = -Math.PI / 2;
     track.position.z = -TRACK_LENGTH / 2 + 25;
     this.scene.add(track);
+    this.fallbackTrack.push(track);
 
     this.groundTexture = this.ownTexture(canvasTexture(96, 96, (ctx) => {
       ctx.fillStyle = "#c5a270";
@@ -230,14 +258,18 @@ export class GameRenderer {
       for (let i = 0; i < 42; i++) ctx.fillRect((i * 31 + 5) % 96, (i * 17 + 11) % 96, 1, 1);
     }));
     this.groundTexture.wrapS = this.groundTexture.wrapT = THREE.RepeatWrapping;
-    this.groundTexture.repeat.set(10, TRACK_LENGTH / 8);
-    const ground = new THREE.Mesh(
-      this.ownGeometry(new THREE.PlaneGeometry(80, TRACK_LENGTH)),
-      this.ownMaterial(new THREE.MeshStandardMaterial({ map: this.groundTexture, roughness: 1 })),
-    );
-    ground.rotation.x = -Math.PI / 2;
-    ground.position.set(0, -0.025, -TRACK_LENGTH / 2 + 25);
-    this.scene.add(ground);
+    // Paving stops at the rail corridor so the kit's sunken ballast bed shows;
+    // the corridor's travertine curbs (or the fallback track plane) cover the seam.
+    const groundWidth = 40 - CORRIDOR_HALF_WIDTH;
+    this.groundTexture.repeat.set(groundWidth / 8, TRACK_LENGTH / 8);
+    const groundGeometry = this.ownGeometry(new THREE.PlaneGeometry(groundWidth, TRACK_LENGTH));
+    const groundMaterial = this.ownMaterial(new THREE.MeshStandardMaterial({ map: this.groundTexture, roughness: 1 }));
+    for (const side of [-1, 1]) {
+      const ground = new THREE.Mesh(groundGeometry, groundMaterial);
+      ground.rotation.x = -Math.PI / 2;
+      ground.position.set(side * (CORRIDOR_HALF_WIDTH + groundWidth / 2), -0.025, -TRACK_LENGTH / 2 + 25);
+      this.scene.add(ground);
+    }
 
     this.createRails();
     this.createScenery();
@@ -252,6 +284,76 @@ export class GameRenderer {
     // Missing model files are an expected optional-asset path; procedural
     // geometry remains visible while these async requests resolve.
     void this.loadModels();
+    void this.loadKit();
+  }
+
+  private async loadKit() {
+    try {
+      const kit = await TrackKit.load(this.modelLoader, kitUrl(), this.renderer);
+      if (this.disposed) {
+        kit.dispose();
+        return;
+      }
+      this.installKit(kit);
+    } catch {
+      // The kit is optional: the procedural track, box trains and simple
+      // pickups stay in place if any kit file is missing or fails to decode.
+    }
+  }
+
+  private installKit(kit: TrackKit) {
+    this.kit = kit;
+    for (const object of this.fallbackTrack) object.visible = false;
+    this.trackSlots = Math.ceil((TRACK_AHEAD + TRACK_BEHIND) / KIT_SEGMENT_LENGTH) + 1;
+    kit.trackParts.forEach((part, variant) => {
+      for (const primitive of part?.primitives ?? []) {
+        const mesh = new THREE.InstancedMesh(primitive.geometry, primitive.material, this.trackSlots);
+        mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+        mesh.frustumCulled = false;
+        mesh.count = 0;
+        this.scene.add(mesh);
+        this.trackBatches.push({ mesh, variant, matrix: primitive.matrix });
+      }
+    });
+    const coin = kit.coin;
+    if (coin) {
+      this.coinMesh.geometry = coin.geometry;
+      this.coinMesh.material = coin.material;
+    }
+    // Rebuild live and pooled obstacles/power-ups with kit art on the next frame.
+    this.resetEntitySync();
+    this.obstaclePool.clear();
+    this.powerPool.clear();
+    this.pooledObstacleCount = 0;
+    this.pooledPowerCount = 0;
+    this.updateTrack(this.sceneryDistance);
+  }
+
+  /**
+   * Recycles the instanced 6 m track segments around the player. Each variant
+   * batch draws only the slots it fills, so unused variants cost nothing.
+   */
+  private updateTrack(travelled: number) {
+    if (!this.trackBatches.length) return;
+    const first = Math.floor(travelled / KIT_SEGMENT_LENGTH) - Math.ceil(TRACK_BEHIND / KIT_SEGMENT_LENGTH);
+    const hasFar = this.trackBatches.some((batch) => batch.variant === 2);
+    const counts = [0, 0, 0];
+    for (let i = 0; i < this.trackSlots; i++) {
+      const k = first + i;
+      const z = -(k * KIT_SEGMENT_LENGTH - travelled);
+      // Roughly one segment in five is the worn, jointed variant with weeds.
+      let variant = kitHash(k) % 5 === 0 ? 1 : 0;
+      if (hasFar && z < -TRACK_DETAIL_DISTANCE) variant = 2;
+      const slot = counts[variant]++;
+      this.segmentMatrix.makeTranslation(0, 0, z);
+      for (const batch of this.trackBatches) {
+        if (batch.variant === variant) batch.mesh.setMatrixAt(slot, this.modelMatrix.multiplyMatrices(this.segmentMatrix, batch.matrix));
+      }
+    }
+    for (const batch of this.trackBatches) {
+      batch.mesh.count = counts[batch.variant];
+      batch.mesh.instanceMatrix.needsUpdate = true;
+    }
   }
 
   private ownGeometry<T extends THREE.BufferGeometry>(geometry: T) {
@@ -293,20 +395,11 @@ export class GameRenderer {
     const rawBounds = new THREE.Box3().setFromObject(root);
     if (rawBounds.isEmpty()) return null;
 
-    const rawSize = rawBounds.getSize(new THREE.Vector3());
-    const isTrain = TRAIN_MODEL_KEYS.includes(key);
-    // The generated rail cars can arrive with their long axis on X or Z. Rotate
-    // X-long cars so their length runs down the track, with their front at +Z.
-    const alignment = new THREE.Matrix4();
-    if (isTrain && rawSize.x > rawSize.z) alignment.makeRotationY(-Math.PI / 2);
-    const alignedBounds = rawBounds.clone().applyMatrix4(alignment);
-    const size = alignedBounds.getSize(new THREE.Vector3());
+    const size = rawBounds.getSize(new THREE.Vector3());
     if (size.x < 0.0001 || size.y < 0.0001 || size.z < 0.0001) return null;
 
-    const center = alignedBounds.getCenter(new THREE.Vector3());
-    const normalization = new THREE.Matrix4()
-      .makeTranslation(-center.x, -alignedBounds.min.y, -center.z)
-      .multiply(alignment);
+    const center = rawBounds.getCenter(new THREE.Vector3());
+    const normalization = new THREE.Matrix4().makeTranslation(-center.x, -rawBounds.min.y, -center.z);
     const primitives: ModelPrimitive[] = [];
     root.traverse((object) => {
       const mesh = object as THREE.Mesh;
@@ -337,10 +430,6 @@ export class GameRenderer {
     if (key === "station") {
       this.stationBatches = this.createModelBatches(template, this.railProps.length);
       this.updateRailwayProps(this.sceneryDistance);
-      return;
-    }
-    if (TRAIN_MODEL_KEYS.includes(key)) {
-      this.mountAvailableTrainModels();
       return;
     }
     this.mountPursuers(key);
@@ -396,40 +485,6 @@ export class GameRenderer {
       root.add(mesh);
     }
     return root;
-  }
-
-  private mountTrainModel(group: THREE.Group, liveryIndex: number, length: number) {
-    if (group.userData.trainModel) return;
-    const preferred = TRAIN_MODEL_KEYS[liveryIndex % TRAIN_MODEL_KEYS.length];
-    const template = this.modelTemplates.get(preferred)
-      ?? this.modelTemplates.get("terracottaTrain")
-      ?? this.modelTemplates.get("silverTrain");
-    if (!template) return;
-    // The normalized clone is grounded and centered. Offset it so its +Z front
-    // meets the obstacle's front face while its width stays inside one lane.
-    const scale = MODEL_WIDTH / template.size.x;
-    const carLength = template.size.z * scale;
-    const cars = Math.max(1, Math.round(length / carLength));
-    const fitted = length / cars;
-    const train = new THREE.Group();
-    for (let i = 0; i < cars; i++) {
-      const car = this.createModelClone(template, MODEL_WIDTH, template.size.y * scale, fitted * 0.97);
-      car.position.z = -(i + 0.5) * fitted;
-      train.add(car);
-    }
-    group.add(train);
-    group.userData.trainModel = train;
-  }
-
-  private mountAvailableTrainModels() {
-    const mount = (object: THREE.Object3D) => {
-      const group = object as THREE.Group;
-      const liveryIndex = group.userData.trainLiveryIndex as number | undefined;
-      const length = group.userData.baseLength as number | undefined;
-      if (liveryIndex !== undefined && length !== undefined) this.mountTrainModel(group, liveryIndex, length);
-    };
-    for (const entry of this.obstacleActive.values()) mount(entry.object);
-    for (const available of this.obstaclePool.values()) for (const object of available) mount(object);
   }
 
   private disposeLoadedTemplate(template: ModelTemplate) {
@@ -510,6 +565,7 @@ export class GameRenderer {
         const rail = new THREE.Mesh(railGeo, this.res.railMat);
         rail.position.set(lane * LANE_WIDTH + offset, 0.055, -TRACK_LENGTH / 2 + 25);
         this.scene.add(rail);
+        this.fallbackTrack.push(rail);
       }
     }
   }
@@ -846,15 +902,36 @@ export class GameRenderer {
   }
 
   private obstacleKey(obstacle: Obstacle) {
+    // Pool long vehicles by style and half-unit base length, then scale to the exact world length.
+    const lengthBucket = Math.max(0.5, Math.round(obstacle.length * 2) / 2);
+    if (this.kit) {
+      const variety = kitHash(obstacle.id);
+      if (obstacle.kind === "barrier") return `kit:barrier:${BARRIER_VARIANTS[variety % BARRIER_VARIANTS.length]}`;
+      if (obstacle.kind === "gate") return `kit:gate:${GATE_VARIANTS[variety % GATE_VARIANTS.length]}`;
+      const style = trainStyleFor(obstacle.id, obstacle.kind === "moving");
+      return `kit:${obstacle.kind}:${style}:${lengthBucket.toFixed(1)}`;
+    }
     if (obstacle.kind === "barrier" || obstacle.kind === "gate") return obstacle.kind;
     const colorIndex = obstacle.kind === "moving" ? 0 : obstacle.id % this.res.trainColors.length;
-    const liveryIndex = obstacle.id % TRAIN_MODEL_KEYS.length;
-    // Pool long vehicles by livery and half-unit base length, then scale to the exact world length.
-    const lengthBucket = Math.max(0.5, Math.round(obstacle.length * 2) / 2);
-    return `${obstacle.kind}:${colorIndex}:${liveryIndex}:${lengthBucket.toFixed(1)}`;
+    return `${obstacle.kind}:${colorIndex}:${lengthBucket.toFixed(1)}`;
+  }
+
+  private makeKitObstacle(kit: TrackKit, obstacle: Obstacle, key: string) {
+    const [, kind, variant, lengthKey] = key.split(":");
+    let object: THREE.Group;
+    if (kind === "barrier") object = kit.createBarrier(variant as BarrierVariant);
+    else if (kind === "gate") object = kit.createGate(variant as GateVariant);
+    else {
+      const length = Number(lengthKey);
+      object = kit.createTrain(variant as TrainStyle, length, kind === "moving", obstacle.id);
+      object.userData.baseLength = length;
+    }
+    object.userData.poolKey = key;
+    return object;
   }
 
   private makeObstacle(obstacle: Obstacle, key: string): THREE.Object3D {
+    if (this.kit && key.startsWith("kit:")) return this.makeKitObstacle(this.kit, obstacle, key);
     const r = this.res;
     const group = new THREE.Group();
     const add = (mat: THREE.Material, sx: number, sy: number, sz: number, x: number, y: number, z: number) => {
@@ -872,9 +949,8 @@ export class GameRenderer {
       add(r.postMat, 0.18, 2.6, 0.18, 1.0, 1.3, 0);
       add(r.gateMat, 2.2, 0.9, 0.2, 0, 1.85, 0);
     } else {
-      const [, , liveryKey, lengthKey] = key.split(":");
+      const [, , lengthKey] = key.split(":");
       const length = Number(lengthKey);
-      const liveryIndex = Number(liveryKey);
       const moving = obstacle.kind === "moving";
       const colorIndex = moving ? 0 : obstacle.id % r.trainColors.length;
       const mat = moving ? r.movingMat : r.trainColors[colorIndex];
@@ -885,8 +961,6 @@ export class GameRenderer {
       add(r.lightMat, 0.3, 0.2, 0.05, -0.65, 0.7, 0.02);
       add(r.lightMat, 0.3, 0.2, 0.05, 0.65, 0.7, 0.02);
       group.userData.baseLength = length;
-      group.userData.trainLiveryIndex = liveryIndex;
-      this.mountTrainModel(group, liveryIndex, length);
     }
     group.userData.poolKey = key;
     return group;
@@ -894,7 +968,8 @@ export class GameRenderer {
 
   private makePowerPickup(kind: Exclude<Pickup["kind"], "coin">) {
     const group = new THREE.Group();
-    group.add(new THREE.Mesh(this.res.powerGeos[kind], this.res.powerMats[kind]));
+    if (this.kit?.hasPart(`power:${kind}`)) group.add(this.kit.createPower(kind));
+    else group.add(new THREE.Mesh(this.res.powerGeos[kind], this.res.powerMats[kind]));
     group.add(new THREE.Mesh(this.res.ringGeo, this.res.ringMat));
     return group;
   }
@@ -1020,7 +1095,8 @@ export class GameRenderer {
       if (pickup.kind !== "coin" || pickup.collected || count === COIN_CAPACITY) continue;
       const bob = this.reducedMotion ? 0 : Math.sin(time * 3 + pickup.id) * 0.04;
       this.coinDummy.position.set(pickup.x, pickup.y + bob, -(pickup.s - playerS));
-      this.coinDummy.rotation.set(Math.PI / 2, this.reducedMotion ? 0 : time * 4 + pickup.id, 0);
+      // The kit aureus faces +Z; the fallback cylinder needs tipping upright.
+      this.coinDummy.rotation.set(this.kit?.coin ? 0 : Math.PI / 2, this.reducedMotion ? 0 : time * 4 + pickup.id, 0);
       this.coinDummy.scale.setScalar(1);
       this.coinDummy.updateMatrix();
       this.coinMesh.setMatrixAt(count++, this.coinDummy.matrix);
@@ -1053,6 +1129,8 @@ export class GameRenderer {
     this.trackTexture.offset.y = travelled / SLEEPER_SPACING;
     this.groundTexture.offset.y = travelled / 8;
     this.updateScenery(travelled);
+    this.updateTrack(travelled);
+    this.kit?.update(t, this.reducedMotion);
     this.updatePursuers(t, world);
 
     this.syncObstacles(world.obstacles, p.s, this.syncEpoch);
@@ -1131,6 +1209,9 @@ export class GameRenderer {
     for (const batches of [...Object.values(this.buildingBatches), this.stationBatches]) {
       for (const batch of batches ?? []) batch.mesh.dispose();
     }
+    for (const batch of this.trackBatches) batch.mesh.dispose();
+    this.kit?.dispose();
+    this.kit = null;
     for (const texture of this.loadedTextures) texture.dispose();
     for (const material of this.loadedMaterials) material.dispose();
     for (const geometry of this.loadedGeometries) geometry.dispose();
