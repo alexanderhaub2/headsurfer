@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
-import type { Action } from "./types";
+import type { Action, ActionBlockReason, ActionResult } from "./types";
 import { GameController, type HudState } from "./game/controller";
 import type { World, WorldEvent } from "./game/world";
 import { HeadTracker, type TrackingFrame } from "./tracking/headTracker";
 import { GestureEngine } from "./tracking/gestureEngine";
-import { OUTFITS, dailyChallenges } from "./meta/progression";
+import { CHARACTERS, dailyChallenges } from "./meta/progression";
 import {
   loadLeaderboard,
   loadProfile,
@@ -19,21 +19,29 @@ import { GestureGuide } from "./ui/GestureGuide";
 import { CameraPanel } from "./ui/CameraPanel";
 import { Hud } from "./ui/Hud";
 import { HowItWorksView, LeaderboardView, RewardsView, SettingsView } from "./ui/Views";
-import { Icon, Mascot } from "./ui/Icons";
+import { Icon, Mascot, Wordmark, type IconName } from "./ui/Icons";
 import { swipeAction, type SwipePoint } from "./ui/touchInput";
 
 type View = "play" | "leaderboard" | "rewards" | "how" | "settings";
 type Phase = "menu" | "camera" | "calibrate" | "tutorial" | "countdown" | "running" | "paused" | "over";
 type InputMode = "head" | "keyboard";
 
+const NAV_ITEMS: [View, string, IconName][] = [
+  ["play", "Play", "home"],
+  ["leaderboard", "Leaderboard", "trophy"],
+  ["rewards", "Rewards", "gift"],
+  ["how", "How it works", "info"],
+  ["settings", "Settings", "settings"],
+];
+
 const TUTORIAL: { action: Action; prompt: string }[] = [
   { action: "jump", prompt: "Lift your chin slightly to jump" },
   { action: "roll", prompt: "Lower your chin toward your chest to roll / duck" },
-  { action: "left", prompt: "Slowly tilt your head left" },
-  { action: "right", prompt: "Slowly tilt your head right" },
+  { action: "left", prompt: "Tilt or turn your head left" },
+  { action: "right", prompt: "Tilt or turn your head right" },
 ];
 const CALIBRATION_MS = 1500;
-const FACE_LOST_PAUSE_MS = 1200;
+const FACE_LOST_PAUSE_MS = 350;
 const KEYMAP: Record<string, Action> = {
   ArrowLeft: "left",
   KeyA: "left",
@@ -51,10 +59,38 @@ const EMPTY_HUD: HudState = { score: 0, coins: 0, distance: 0, multiplier: 1, co
 interface Popup {
   id: number;
   text: string;
-  tone: "good" | "bad" | "power";
+  tone: "good" | "bad" | "power" | "info";
 }
 
 type RunResult = RunOutcome & { score: number; stats: World["stats"]; crashedInto: string | null };
+
+interface TrackingDiagnostics {
+  inferenceMs: number | null;
+  inferenceFps: number;
+  targetInferenceFps: number;
+  frameToActionMs: number | null;
+  frameToNextFrameMs: number | null;
+  lastAction: Action | null;
+  lastOutcome: "accepted" | "blocked" | null;
+}
+
+const EMPTY_TRACKING_DIAGNOSTICS: TrackingDiagnostics = {
+  inferenceMs: null,
+  inferenceFps: 0,
+  targetInferenceFps: 0,
+  frameToActionMs: null,
+  frameToNextFrameMs: null,
+  lastAction: null,
+  lastOutcome: null,
+};
+
+const BLOCKED_ACTION_COPY: Record<ActionBlockReason, string> = {
+  "lane-edge": "Already at the edge",
+  airborne: "Land before jumping again",
+  "roll-queued": "Roll is already queued",
+  rolling: "Already rolling",
+  "not-running": "Run is paused",
+};
 
 export default function App() {
   const [view, setView] = useState<View>("play");
@@ -76,6 +112,7 @@ export default function App() {
   const [pauseReason, setPauseReason] = useState<"user" | "face" | null>(null);
   const [result, setResult] = useState<RunResult | null>(null);
   const [webglError, setWebglError] = useState(false);
+  const [trackingDiagnostics, setTrackingDiagnostics] = useState<TrackingDiagnostics>(EMPTY_TRACKING_DIAGNOSTICS);
   const [tracker, setTracker] = useState<HeadTracker | null>(null);
   const touchFirst = useMemo(() => typeof window !== "undefined" && (window.matchMedia?.("(pointer: coarse)").matches ?? false), []);
 
@@ -94,6 +131,8 @@ export default function App() {
   const runActiveRef = useRef(false);
   const popupId = useRef(0);
   const cameraRequestRef = useRef(0);
+  const diagnosticsUiAtRef = useRef(-Infinity);
+  const actionSampleRef = useRef(0);
   const swipeRef = useRef<SwipePoint | null>(null);
 
   const setPhase = useCallback((p: Phase) => {
@@ -205,13 +244,40 @@ export default function App() {
   }, []);
 
   const handleAction = useCallback(
-    (action: Action) => {
-      setFlash((f) => ({ action, id: (f?.id ?? 0) + 1 }));
+    (action: Action, source: InputMode = "keyboard", frameTime?: number) => {
       const controller = controllerRef.current;
       const current = phaseRef.current;
-      if (current === "running") controller?.input(action);
-      else if (current === "tutorial") {
-        controller?.input(action);
+      if (current === "over" && action === "jump" && performance.now() - overAtRef.current > 1500) {
+        beginRun();
+        return;
+      }
+      if (current !== "running" && current !== "tutorial") return;
+
+      const outcome: ActionResult = controller?.input(action) ?? { accepted: false, action, reason: "not-running" };
+      if (source === "head" && frameTime !== undefined) {
+        const actionSample = ++actionSampleRef.current;
+        const frameToActionMs = Math.max(0, performance.now() - frameTime);
+        setTrackingDiagnostics((previous) => ({
+          ...previous,
+          lastAction: action,
+          lastOutcome: outcome.accepted ? "accepted" : "blocked",
+          frameToActionMs,
+          frameToNextFrameMs: null,
+        }));
+        if (outcome.accepted) {
+          requestAnimationFrame((nextFrameAt) => {
+            if (actionSampleRef.current !== actionSample) return;
+            setTrackingDiagnostics((previous) => ({ ...previous, frameToNextFrameMs: Math.max(0, nextFrameAt - frameTime) }));
+          });
+        }
+      }
+      if (!outcome.accepted) {
+        if (current === "running") pushPopup(BLOCKED_ACTION_COPY[outcome.reason], "info");
+        return;
+      }
+
+      setFlash((f) => ({ action, id: (f?.id ?? 0) + 1 }));
+      if (current === "tutorial") {
         const step = stateRef.current.tutorialStep;
         if (TUTORIAL[step]?.action === action) {
           controller?.sfx.play({ type: "gesture" });
@@ -221,16 +287,22 @@ export default function App() {
           }
           setTutorialStep(step + 1);
         }
-      } else if (current === "over" && action === "jump" && performance.now() - overAtRef.current > 1500) {
-        // Look up (or press up) to retry without touching the mouse.
-        beginRun();
       }
     },
-    [beginRun, finishTutorial],
+    [beginRun, finishTutorial, pushPopup],
   );
 
   const onFrame = useCallback(
     (frame: TrackingFrame) => {
+      if (frame.time - diagnosticsUiAtRef.current >= 200) {
+        diagnosticsUiAtRef.current = frame.time;
+        setTrackingDiagnostics((previous) => ({
+          ...previous,
+          inferenceMs: frame.inferenceMs,
+          inferenceFps: frame.telemetry.inferenceFps,
+          targetInferenceFps: frame.telemetry.targetInferenceFps,
+        }));
+      }
       const face = faceRef.current;
       if (frame.pose) {
         face.last = frame.time;
@@ -279,7 +351,7 @@ export default function App() {
         return;
       }
       if (inputModeRef.current !== "head") return;
-      if (action) handleAction(action);
+      if (action) handleAction(action, "head", frame.time);
 
       if ((current === "running" || current === "countdown") && runActiveRef.current && frame.time - face.last > FACE_LOST_PAUSE_MS) {
         pause("face");
@@ -361,8 +433,8 @@ export default function App() {
   }, [settings, engine]);
 
   useEffect(() => {
-    const outfit = OUTFITS.find((o) => o.id === profile.outfit) ?? OUTFITS[0];
-    controllerRef.current?.renderView.setOutfit(outfit);
+    const character = CHARACTERS.find((candidate) => candidate.id === profile.outfit) ?? CHARACTERS[0];
+    controllerRef.current?.renderView.setCharacter(character);
   }, [profile.outfit]);
 
   // Leaving the play view pauses the run.
@@ -495,61 +567,45 @@ export default function App() {
   const tutorialTarget = phase === "tutorial" ? TUTORIAL[tutorialStep]?.action : null;
   const showHud = phase === "running" || phase === "paused" || phase === "countdown" || phase === "over";
   const myEntryDate = result?.rank ? result.board[result.rank - 1]?.date : undefined;
+  const showDiagnostics = import.meta.env.DEV || new URLSearchParams(window.location.search).has("debug");
 
   return (
     <div className={`app ${focus ? "is-focus" : ""}`}>
       <header className="topnav">
-        <button className="brand" onClick={() => setView("play")}>
-          <span className="logo"><Mascot small /></span>
-          <span className="brand-name">
-            Going <b>Head</b> <em>Surface</em>
-          </span>
-          <span className="brand-route"><Icon name="rail" />Rome Rail Pursuit</span>
+        <button className="brand" onClick={() => setView("play")} aria-label="HeadSurfers home">
+          <Wordmark />
         </button>
+
         <nav aria-label="Main navigation">
-          {(
-            [
-              ["play", "Play"],
-              ["leaderboard", "Leaderboard"],
-              ["rewards", "Rewards"],
-              ["how", "How it works"],
-              ["settings", "Settings"],
-            ] as [View, string][]
-          ).map(([id, label]) => (
-            <button key={id} className={view === id ? "active" : ""} aria-current={view === id ? "page" : undefined} onClick={() => setView(id)}>
-              {label}
+          {NAV_ITEMS.map(([id, label, icon]) => (
+            <button
+              key={id}
+              className={`nav-${id} ${view === id ? "active" : ""}`}
+              aria-current={view === id ? "page" : undefined}
+              onClick={() => setView(id)}
+            >
+              <Icon name={icon} />
+              <span>{label}</span>
             </button>
           ))}
         </nav>
+
         <div className="nav-tools">
-          <button className="sound-toggle" aria-label={settings.sound ? "Mute sound" : "Enable sound"} onClick={() => setSettings((s) => ({ ...s, sound: !s.sound }))}><Icon name={settings.sound ? "sound" : "muted"} /></button>
-          <div className="wallet" title="In-game coins on this device"><span className="coin-icon" aria-hidden />{profile.wallet.toLocaleString()}</div>
+          <button className="tool-button" aria-label={settings.sound ? "Mute sound" : "Enable sound"} onClick={() => setSettings((s) => ({ ...s, sound: !s.sound }))}>
+            <Icon name={settings.sound ? "sound" : "muted"} />
+          </button>
+          <button className={`tool-button settings-button ${view === "settings" ? "active" : ""}`} aria-label="Settings" onClick={() => setView("settings")}>
+            <Icon name="settings" />
+          </button>
+          <div className="wallet" title="In-game coins on this device">
+            <span className="coin-icon" aria-hidden />
+            <span>{profile.wallet.toLocaleString()}</span>
+          </div>
         </div>
       </header>
 
       <main className={`layout ${view !== "play" ? "hidden-game" : focus ? "focus" : "landing"}`}>
-        {view === "play" && !focus && (
-          <section className="route-ticket" aria-label="Rome Rail Pursuit">
-            <span className="ticket-stamp" aria-hidden>ROMA<b>01</b></span>
-            <p className="eyebrow"><Icon name="rail" /> ROUTE 01 · ROMA → NAPOLI</p>
-            <h1>A little tilt. <span>A Roman getaway.</span></h1>
-            <p className="lede">Three mafiosi are on your heels. Tilt to switch rails, lift your chin to leap, lower it to duck. The camera works on this device only.</p>
-            <dl className="ticket-stats">
-              <div><dt>Best run</dt><dd>{profile.bestScore.toLocaleString()}</dd></div>
-              <div><dt>Runs</dt><dd>{profile.runs.toLocaleString()}</dd></div>
-              <div><dt>Quests</dt><dd>{challenges.filter((c) => profile.claimed.includes(c.id)).length}/3</dd></div>
-            </dl>
-            <ul className="cast" aria-label="Your pursuers">
-              <li><i className="cast-dot fedora" /><b>Il Cappello</b><span>the fedora</span></li>
-              <li><i className="cast-dot coat" /><b>Il Cappotto</b><span>the trenchcoat</span></li>
-              <li><i className="cast-dot floral" /><b>I Fiori</b><span>the floral shirt</span></li>
-            </ul>
-            <p className="ticket-note">Original 3D route: travertine palazzi, Naples balconies, a volcanic-stone station and two city trains.</p>
-          </section>
-        )}
-
         <section className="game-column">
-          <div className="stage-label"><span><i className="live-dot" /> {focus ? "NOW RUNNING · ROUTE 01" : "ROME RAIL PURSUIT"}</span><span>{inputMode === "head" ? "HEAD CONTROLS" : touchFirst ? "SWIPE CONTROLS" : "KEYBOARD READY"}</span></div>
           <div className="game-viewport" onPointerDown={onSwipeStart} onPointerUp={onSwipeEnd} onPointerCancel={() => { swipeRef.current = null; }}>
             <div ref={gameRef} className="game-canvas" />
             {showHud && <Hud hud={hud} onPause={phase === "running" ? () => pause("user") : undefined} />}
@@ -577,19 +633,23 @@ export default function App() {
             {phase === "menu" && !webglError && (
               <div className="overlay menu">
                 <div className="menu-title">
-                  <span className="menu-kicker">Rome Rail Pursuit</span>
-                  <h1>
-                    Going <span>Head</span> Surface
-                  </h1>
+                  <span className="menu-kicker"><Icon name="rail" /> Rome Rail Pursuit</span>
+                  <Wordmark />
                   <p className="tagline">Your head is the controller. They are right behind you.</p>
                 </div>
-                <button className="primary big" onClick={startHead}>
-                  <Icon name="play" /> Play with your head
-                </button>
-                <button className="secondary" onClick={startKeyboard}>
-                  <Icon name={touchFirst ? "touch" : "keyboard"} /> {touchFirst ? "Play with swipes" : "Play with keyboard"}
-                </button>
-                <p className="menu-privacy"><Icon name="shield" /> Camera stays local. No recording.</p>
+                <div className="menu-actions">
+                  <button className="primary big" onClick={startHead}>
+                    <Icon name="camera" /> Play with your head
+                  </button>
+                  <button className="secondary" onClick={startKeyboard}>
+                    <Icon name={touchFirst ? "touch" : "keyboard"} /> {touchFirst ? "Play with swipes" : "Play with keyboard"}
+                  </button>
+                  <p className="menu-privacy"><Icon name="shield" /> Camera stays local. No recording.</p>
+                  <div className="menu-stats">
+                    <span><Icon name="trophy" /> Best {profile.bestScore.toLocaleString()}</span>
+                    <span><Icon name="bolt" /> {challenges.filter((c) => profile.claimed.includes(c.id)).length}/3 daily quests</span>
+                  </div>
+                </div>
               </div>
             )}
 
@@ -728,7 +788,10 @@ export default function App() {
               </div>
             )}
           </div>
-          <div className="stage-footer"><span><Icon name="shield" /> Private by design</span><span>{touchFirst ? "Swipe ← → to switch · ↑ jump · ↓ roll" : <><kbd>P</kbd> pause · <kbd>↑</kbd> jump · <kbd>↓</kbd> roll</>}</span></div>
+          <div className="stage-footer">
+            <span className={`input-mode ${inputMode}`}><i className="live-dot" />{inputMode === "head" ? "Head controls" : touchFirst ? "Swipe controls" : "Keyboard ready"}</span>
+            <span className="key-hints">{touchFirst ? "Swipe ← → lanes · ↑ jump · ↓ roll" : <><kbd>P</kbd> pause <kbd>↑</kbd> jump <kbd>↓</kbd> roll <kbd>←→</kbd> lanes</>}</span>
+          </div>
         </section>
 
         <aside className="side-column">
@@ -742,25 +805,48 @@ export default function App() {
             showCamera={settings.showCamera}
             showLandmarks={settings.showLandmarks}
             sensitivity={settings.sensitivity}
+            flash={flash}
+            highlight={tutorialTarget}
+            invertVertical={settings.invertVertical}
             onSensitivity={(sensitivity) => setSettings((s) => ({ ...s, sensitivity }))}
             onEnable={startHead}
             onStop={stopCamera}
             onToggleCamera={() => setSettings((s) => ({ ...s, showCamera: !s.showCamera }))}
             onRecalibrate={recalibrate}
             canRecalibrate={trackerActive && inputMode === "head" && phase !== "camera" && phase !== "calibrate"}
+            showDiagnostics={showDiagnostics}
+            diagnostics={trackingDiagnostics}
           />
           <GestureGuide flash={flash} highlight={tutorialTarget} invertVertical={settings.invertVertical} />
-          <section className="panel mini-challenges">
-            <div className="panel-head"><h3><Icon name="trophy" /> Today's little quests</h3><span className="tiny-label">DAILY</span></div>
-            {challenges.map((c) => (
-              <div key={c.id} className={`mini-challenge ${profile.claimed.includes(c.id) ? "done" : ""}`}>
-                <div><span>{c.label}</span><em>
-                  {Math.min(c.target, profile.challengeProgress[c.id] ?? 0)}/{c.target}
-                </em></div>
-                <div className="progress"><i style={{ width: `${Math.min(1, (profile.challengeProgress[c.id] ?? 0) / c.target) * 100}%` }} /></div>
+          <div className="bottom-row">
+            <section className="promo" aria-label="About HeadSurfers">
+              <div className="promo-copy">
+                <h2>Play with your head.<span>Earn coins as you run.</span></h2>
+                <ul className="promo-points">
+                  <li><Icon name="shield" /> Private by design</li>
+                  <li><Icon name="camera" /> Cam stays local</li>
+                  <li><Icon name="globe" /> Runs in your browser</li>
+                </ul>
               </div>
-            ))}
-          </section>
+              <div className="promo-stats">
+                <div><span>Personal best</span><strong>{profile.bestScore.toLocaleString()}</strong></div>
+                <div><span>Runs</span><strong>{profile.runs.toLocaleString()}</strong></div>
+              </div>
+              <span className="promo-coin c1" aria-hidden />
+              <span className="promo-coin c2" aria-hidden />
+            </section>
+            <section className="panel mini-challenges">
+              <div className="panel-head"><h3><Icon name="trophy" /> Daily quests</h3><span className="tiny-label">Resets daily</span></div>
+              {challenges.map((c) => (
+                <div key={c.id} className={`mini-challenge ${profile.claimed.includes(c.id) ? "done" : ""}`}>
+                  <div><span>{c.label}</span><em>
+                    {Math.min(c.target, profile.challengeProgress[c.id] ?? 0)}/{c.target}
+                  </em></div>
+                  <div className="progress"><i style={{ width: `${Math.min(1, (profile.challengeProgress[c.id] ?? 0) / c.target) * 100}%` }} /></div>
+                </div>
+              ))}
+            </section>
+          </div>
         </aside>
 
         {view !== "play" && (
@@ -769,11 +855,6 @@ export default function App() {
             {view === "rewards" && (
               <RewardsView
                 profile={profile}
-                onBuy={(id) => {
-                  const outfit = OUTFITS.find((o) => o.id === id);
-                  if (!outfit || profile.wallet < outfit.price) return;
-                  updateProfile({ ...profile, wallet: profile.wallet - outfit.price, owned: [...profile.owned, id], outfit: id });
-                }}
                 onSelect={(id) => updateProfile({ ...profile, outfit: id })}
               />
             )}
@@ -782,7 +863,7 @@ export default function App() {
           </section>
         )}
       </main>
-      <footer className="site-footer"><span>Made for curious heads.</span><span>Original game and Rome route models · Not affiliated with Google or any rail operator</span></footer>
+      <footer className="site-footer"><span>Made for curious heads.</span><span>Original game and Rome route models · Camera processed on-device</span></footer>
     </div>
   );
 }

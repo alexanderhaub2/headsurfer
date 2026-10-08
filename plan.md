@@ -10,7 +10,7 @@ Camera frames and face geometry stay local, unrecorded and unpersisted. No accou
 
 **Mobile camera.** Mount the real muted inline video in the visible camera panel before playback, rather than leave it detached. Keep the live source onscreen during setup/play and never `display:none` it to hide the preview; an overlay can hide pixels without stopping capture. Set inline/autoplay attributes explicitly. Request the user-facing camera with soft constraints and controlled fallback for constraint errors, not repeated requests after permission denial. Explain insecure HTTP, iframe policy, unavailable/busy camera and playback errors separately. Bound startup waits, preserve cancellation/resource ownership, and expose measured diagnostics instead of inventing confidence.
 
-**Precision.** Preserve calibrated one-action locking, finite/aspect-aware pose math, stable calibration and return-to-center. Improve filtering based on actual sample time and reject isolated tracking spikes without making intentional gestures require large motion. Add deterministic noisy-sequence and timing regression tests. Keep optional lateral mapping semantics; do not silently import or merge the team's separate unmerged gesture branch.
+**Precision.** Preserve calibrated one-action locking, finite/aspect-aware pose math, stable calibration and return-to-center. Use combined tilt-or-turn lane controls by default, time-aware smoothing that does not add lag at 20 FPS, signed early intent through modest diagonal movement, and a one-frame path for strong clean gestures. Reject isolated tracking spikes without making intentional gestures require large motion. Expose measured inference plus frame-to-action/next-frame diagnostics in debug mode, and add deterministic noisy-sequence and timing regression tests. Keep optional lateral mapping semantics; do not silently import or merge the team's separate unmerged gesture branch.
 
 **Asset-led scene.** Keep the optimized WebP runtime art and original audio, not the large archival PNG/GLB files. Make supplied buildings/rail cars read coherently in the world, reduce repeated facade/rail draw calls where practical, and keep visual obstacle width inside the lane collision footprint. Preserve physics and entity pools. Maintain reset-safe scenery and proper texture/buffer disposal.
 
@@ -49,3 +49,10 @@ Synthetic/browser-emulated tests cannot establish real-person accuracy or guaran
 ## Final user-directed scope adjustment
 
 Use true optimized GLB models in the game, not the initially planned WebP facade/sprite treatment. Mafiosi chase from behind facing -Z with lightweight procedural run motion; no new physics. Under the hackathon time limit, prioritize removal of stray origin instances, proportional models, clear lanes, mobile inline capture and centered play. The obstructing station canopy and overhead black bars are disabled; no further decorative expansion. Runtime model pack ~1.8 MB. Deliver a feature-branch commit/PR without merging main.
+
+## Character integration
+
+- **Player asset:** replace the temporary procedural runner with the supplied, textured Mixamo GLB for Konrad. Preserve the prior primitive rig only as a non-blocking runtime fallback if the asset cannot load.
+- **Animation bridge:** drive the GLB's named clips through `AnimationMixer`: loop `Run` while the runner is active, play `BigJump` for jumps and `RunToRolling` for rolls. The game simulation remains the source of truth for lanes, collisions and score.
+- **Selection:** change the former outfit storefront into a no-cost character selector with Konrad (default/current), Aris, Raj and Alex. The same supplied GLB is reused with distinct material tints for the three additional selectable runners until unique art is supplied.
+- **Performance and delivery:** embed the GLB PBR maps as supplied, load it only once into the Three.js scene and dispose its resources with the renderer. Keep the game browser-only and avoid new dependencies.

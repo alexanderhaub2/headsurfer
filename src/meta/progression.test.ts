@@ -1,7 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { dailyChallenges, insertLeaderboard, type LeaderboardEntry } from "./progression";
+import { CHARACTERS, dailyChallenges, insertLeaderboard, type LeaderboardEntry } from "./progression";
 
 describe("progression", () => {
+  it("exposes the four requested character selections", () => {
+    expect(CHARACTERS.map((character) => character.name)).toEqual(["Konrad", "Aris", "Raj", "Alex"]);
+    expect(CHARACTERS[0].id).toBe("konrad");
+    expect(CHARACTERS.find((character) => character.id === "konrad")?.playerModel).toBe("konrad");
+    expect(CHARACTERS.find((character) => character.id === "raj")?.playerModel).toBe("raj");
+  });
+
   it("creates three distinct, deterministic daily challenges", () => {
     const a = dailyChallenges("2026-10-08");
     expect(a).toHaveLength(3);
